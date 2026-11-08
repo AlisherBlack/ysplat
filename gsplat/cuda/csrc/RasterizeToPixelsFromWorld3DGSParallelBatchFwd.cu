@@ -223,6 +223,7 @@ __device__ __forceinline__ void process_batch_gaussians_fwd(
     {
         return;
     }
+    const float ray_t[PIXELS_PER_THREAD] = {};
 
     (void)process_logical_batch_gaussians<
         CDIM,
@@ -257,6 +258,9 @@ __device__ __forceinline__ void process_batch_gaussians_fwd(
         // Per-pixel rays and accumulation state.
         ray_o,
         ray_d,
+        ray_t,
+        nullptr,
+        nullptr,
         ALL_DONE,
         transmittance_threshold,
         T,
@@ -265,7 +269,11 @@ __device__ __forceinline__ void process_batch_gaussians_fwd(
         normal_out,
         cur_idx,
         n_accumulated,
-        done_mask
+        done_mask,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr
     );
 }
 

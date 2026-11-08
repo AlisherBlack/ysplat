@@ -46,6 +46,7 @@ struct Rasterization3DGSResult
     at::Tensor render_alphas;
     at::Tensor render_extra_signals;
     at::Tensor render_normals;
+    at::Tensor render_depth_moments;
     at::Tensor means2d_absgrad;
     at::Tensor batch_ids;
     at::Tensor camera_ids;
@@ -73,6 +74,7 @@ struct TorchArgDef<Rasterization3DGSResult>
             r.render_alphas,
             r.render_extra_signals,
             r.render_normals,
+            r.render_depth_moments,
             r.means2d_absgrad,
             r.batch_ids,
             r.camera_ids,
@@ -130,6 +132,7 @@ namespace
         bool with_ut,
         ShutterType rolling_shutter,
         bool global_z_order,
+        bool return_depth_dispersion,
         bool use_hit_distance,
         bool return_normals,
         bool distributed
@@ -233,7 +236,8 @@ namespace
             }
         }
 
-        const bool is_lidar_camera = camera_model == CameraModelType::LIDAR;
+        const bool is_lidar_camera     = camera_model == CameraModelType::LIDAR;
+        const bool is_spherical_camera = camera_model == CameraModelType::SPHERICAL;
         TORCH_CHECK(
             has_color || append_depth,
             "Unsupported render_mode. Expected one of RGB, d, Ed, D, ED, "
@@ -248,6 +252,23 @@ namespace
             "Antialiased rasterization is only supported for classic 3DGS"
         );
         TORCH_CHECK(global_z_order || with_ut, "global_z_order can be false only if with_ut=True");
+        TORCH_CHECK(
+            !return_depth_dispersion || with_eval3d,
+            "return_depth_dispersion=True requires with_eval3d=True"
+        );
+        TORCH_CHECK(
+            !is_spherical_camera || (with_ut && with_eval3d),
+            "spherical camera model requires with_ut=True and with_eval3d=True"
+        );
+        TORCH_CHECK(!is_spherical_camera || !global_z_order, "spherical camera model requires global_z_order=False");
+        TORCH_CHECK(
+            !is_spherical_camera
+                || (!radial_coeffs.has_value()
+                    && !tangential_coeffs.has_value()
+                    && !thin_prism_coeffs.has_value()
+                    && !external_distortion_params.has_value()),
+            "spherical camera model does not support camera distortion"
+        );
         TORCH_CHECK(
             with_ut || camera_model != CameraModelType::FTHETA,
             "ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"
@@ -561,6 +582,42 @@ namespace
         return rays.value().expand(expected_shape).contiguous();
     }
 
+    at::optional<at::Tensor> expand_rays_time_for_3dgs(
+        const at::optional<at::Tensor> &rays_time,
+        const at::Tensor &means,
+        const at::Tensor &viewmats,
+        int64_t image_height,
+        int64_t image_width
+    )
+    {
+        if(!rays_time.has_value())
+        {
+            return c10::nullopt;
+        }
+
+        const int64_t batch_ndim = means.dim() - 2;
+        std::vector<int64_t> expected_shape;
+        expected_shape.reserve(batch_ndim + 3);
+        for(int64_t dim = 0; dim < batch_ndim; ++dim)
+        {
+            expected_shape.push_back(means.size(dim));
+        }
+        expected_shape.insert(expected_shape.end(), {viewmats.size(batch_ndim), image_height, image_width});
+        return rays_time.value().expand(expected_shape).contiguous();
+    }
+
+    at::Tensor fold_phase_slots(const at::Tensor &slots, const at::Tensor &primary_valid, int64_t slot_dim, int64_t N)
+    {
+        const at::Tensor primary   = slots.narrow(slot_dim, 0, N);
+        const at::Tensor secondary = slots.narrow(slot_dim, N, N);
+        at::Tensor mask            = primary_valid;
+        while(mask.dim() < primary.dim())
+        {
+            mask = mask.unsqueeze(-1);
+        }
+        return at::where(mask, primary, secondary).contiguous();
+    }
+
     std::vector<int64_t> batch_shape_with(const at::Tensor &means, std::initializer_list<int64_t> suffix)
     {
         std::vector<int64_t> shape;
@@ -786,14 +843,27 @@ Rasterization3DGSResult rasterization_3dgs(
     const at::optional<c10::intrusive_ptr<RowOffsetStructuredSpinningLidarModelParametersExt>> &lidar_coeffs,
     const at::optional<c10::intrusive_ptr<extdist::BivariateWindshieldModelParameters>> &external_distortion_params,
     bool global_z_order,
+    bool return_depth_dispersion,
     bool use_hit_distance,
     bool return_normals,
     int64_t renderer_config,
     const at::optional<std::string> &process_group_name,
-    int64_t world_size
+    int64_t world_size,
+    const at::optional<at::Tensor> &velocities,
+    const at::optional<at::Tensor> &rays_time,
+    bool lidar_phase_modeling
 )
 {
     DEVICE_GUARD(means);
+
+    TORCH_CHECK(
+        !velocities.has_value() || (with_ut && with_eval3d), "velocities require with_ut=True and with_eval3d=True"
+    );
+    TORCH_CHECK(!rays_time.has_value() || rays.has_value(), "rays_time requires rays");
+    TORCH_CHECK(
+        !lidar_phase_modeling || (with_ut && lidar_coeffs.has_value()),
+        "lidar_phase_modeling requires with_ut=True and lidar_coeffs"
+    );
 
     // A non-empty process-group name selects the multi-GPU distributed path.
     // Input validation, including distributed-mode rejection, lives in
@@ -836,6 +906,7 @@ Rasterization3DGSResult rasterization_3dgs(
         with_ut,
         rolling_shutter,
         global_z_order,
+        return_depth_dispersion,
         use_hit_distance,
         return_normals,
         distributed
@@ -848,6 +919,10 @@ Rasterization3DGSResult rasterization_3dgs(
     const int64_t I                            = B * C;
     at::optional<at::Tensor> projection_covars = normalize_covars_for_3dgs(covars);
     at::optional<at::Tensor> raster_rays       = expand_rays_for_3dgs(rays, means, viewmats, image_height, image_width);
+    at::optional<at::Tensor> raster_rays_time
+        = expand_rays_time_for_3dgs(rays_time, means, viewmats, image_height, image_width);
+    at::optional<at::Tensor> contiguous_velocities
+        = velocities.has_value() ? at::optional<at::Tensor>(velocities.value().contiguous()) : c10::nullopt;
 
     // Seam A (distributed): all-gather cameras so this rank projects its local
     // Gaussians against every rank's cameras. `C` becomes the global camera count
@@ -882,6 +957,9 @@ Rasterization3DGSResult rasterization_3dgs(
     at::Tensor depths;
     at::Tensor conics;
     at::Tensor compensations;
+    at::Tensor phase_radii;
+    at::Tensor phase_means2d;
+    at::Tensor phase_depths;
 
     // --- Project Gaussians to 2D -----------------------------------------
     // Project Gaussians to 2D. The packed branch returns sparse visible-Gaussian
@@ -917,7 +995,9 @@ Rasterization3DGSResult rasterization_3dgs(
                 thin_prism_coeffs,
                 ftheta_coeffs,
                 lidar_coeffs,
-                external_distortion_params
+                external_distortion_params,
+                contiguous_velocities,
+                lidar_phase_modeling
             );
         }();
         radii   = projection.radii;
@@ -927,6 +1007,22 @@ Rasterization3DGSResult rasterization_3dgs(
         if(projection.compensations.has_value())
         {
             compensations = projection.compensations.value();
+        }
+        if(lidar_phase_modeling)
+        {
+            const int64_t slot_dim         = batch_ndim + 1;
+            phase_radii                    = radii;
+            phase_means2d                  = means2d;
+            phase_depths                   = depths;
+            const at::Tensor primary_valid = radii.narrow(slot_dim, 0, N).gt(0).all(-1);
+            radii   = at::maximum(radii.narrow(slot_dim, 0, N), radii.narrow(slot_dim, N, N)).contiguous();
+            means2d = fold_phase_slots(means2d, primary_valid, slot_dim, N);
+            depths  = fold_phase_slots(depths, primary_valid, slot_dim, N);
+            conics  = fold_phase_slots(conics, primary_valid, slot_dim, N);
+            if(compensations.defined())
+            {
+                compensations = fold_phase_slots(compensations, primary_valid, slot_dim, N);
+            }
         }
         batch_ids    = empty_like_indices(means);
         camera_ids   = empty_like_indices(means);
@@ -1297,9 +1393,9 @@ Rasterization3DGSResult rasterization_3dgs(
 
     // --- Identify intersecting tiles -------------------------------------
     // Contiguity is kept close to the kernels that require compact inputs.
-    at::Tensor kernel_means2d                    = means2d.contiguous();
-    at::Tensor kernel_radii                      = radii.contiguous();
-    at::Tensor kernel_depths                     = depths.contiguous();
+    at::Tensor kernel_means2d                    = lidar_phase_modeling ? phase_means2d : means2d.contiguous();
+    at::Tensor kernel_radii                      = lidar_phase_modeling ? phase_radii : radii.contiguous();
+    at::Tensor kernel_depths                     = lidar_phase_modeling ? phase_depths : depths.contiguous();
     at::Tensor kernel_conics                     = conics.contiguous();
     at::Tensor kernel_opacities                  = projected_opacities.contiguous();
     at::optional<at::Tensor> kernel_image_ids    = contiguous_optional(image_ids);
@@ -1335,6 +1431,17 @@ Rasterization3DGSResult rasterization_3dgs(
                                                                                   segmented
                                                                               );
 
+    if(lidar_phase_modeling)
+    {
+        const at::Tensor flatten_ids_long = isects.flatten_ids.to(at::kLong);
+        const at::Tensor image_index      = at::floor_divide(flatten_ids_long, 2 * N);
+        const at::Tensor gaussian_index   = at::remainder(at::remainder(flatten_ids_long, 2 * N), N);
+        isects.flatten_ids                = (image_index * N + gaussian_index).to(at::kInt);
+        const int64_t slot_dim            = isects.tiles_per_gauss.dim() - 1;
+        isects.tiles_per_gauss
+            = isects.tiles_per_gauss.narrow(slot_dim, 0, N) + isects.tiles_per_gauss.narrow(slot_dim, N, N);
+    }
+
     at::Tensor isect_offsets
         = call_torch_op<&intersect_offset>("gsplat::intersect_offset", isects.isect_ids, I, tile_width, tile_height);
     std::vector<int64_t> isect_offsets_shape = batch_shape_with(means, {C, tile_height, tile_width});
@@ -1346,6 +1453,7 @@ Rasterization3DGSResult rasterization_3dgs(
     std::vector<at::Tensor> render_color_chunks;
     at::Tensor render_alphas;
     at::Tensor render_normals = at::empty({0}, means.options());
+    at::Tensor render_depth_moments = at::empty({0}, means.options().dtype(at::kFloat));
     at::Tensor absgrad_holder;
     at::Tensor raster_isect_offsets = isect_offsets.contiguous();
     at::Tensor raster_flatten_ids   = isects.flatten_ids.contiguous();
@@ -1394,7 +1502,10 @@ Rasterization3DGSResult rasterization_3dgs(
                 return_normals && start == 0,
                 renderer_config,
                 false, // return_last_ids
-                false  // unsafe_masked_tile_outputs (safe default: masked tiles write defined outputs)
+                false, // unsafe_masked_tile_outputs (safe default: masked tiles write defined outputs)
+                return_depth_dispersion && start == 0,
+                contiguous_velocities,
+                raster_rays_time
             );
             render_color_chunks.push_back(raster.renders);
             if(!render_alphas.defined())
@@ -1404,6 +1515,10 @@ Rasterization3DGSResult rasterization_3dgs(
             if(return_normals && start == 0 && raster.normals.has_value())
             {
                 render_normals = raster.normals.value();
+            }
+            if(start == 0 && raster.depth_moments.has_value())
+            {
+                render_depth_moments = raster.depth_moments.value();
             }
         }
 #    if GSPLAT_BUILD_3DGS
@@ -1470,6 +1585,7 @@ Rasterization3DGSResult rasterization_3dgs(
     result.render_alphas        = render_alphas;
     result.render_extra_signals = render_extra_signals;
     result.render_normals       = render_normals;
+    result.render_depth_moments = render_depth_moments;
     result.means2d_absgrad      = absgrad_holder;
     result.tiles_per_gauss      = isects.tiles_per_gauss;
     result.isect_ids            = isects.isect_ids;

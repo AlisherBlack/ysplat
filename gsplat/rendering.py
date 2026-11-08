@@ -161,6 +161,35 @@ def render_mode_has_only_color(mode: RenderMode) -> bool:
     return not render_mode_has_depth_channel(mode) and render_mode_has_color(mode)
 
 
+def _depth_dispersions_from_linear_moments(
+    depth_moments: Tensor, weight_sum: Tensor
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Close linear depth moments into pairwise squared dispersions.
+
+    The unnormalized outputs are the pairwise numerators
+    ``sum_ij w_i*w_j*(x_i-x_j)**2``. The normalized outputs divide those
+    numerators by ``weight_sum**2`` and are therefore ``2*Var(x)``.
+    """
+    depth_first, depth_second, log_first, log_second = depth_moments.unbind(-1)
+    depth_unnormalized = (
+        2.0 * (weight_sum * depth_second - depth_first.square())
+    ).clamp_min(0.0)
+    log_unnormalized = (2.0 * (weight_sum * log_second - log_first.square())).clamp_min(
+        0.0
+    )
+    positive_weight = weight_sum > 0
+    safe_weight_squared = torch.where(
+        positive_weight, weight_sum.square(), torch.ones_like(weight_sum)
+    )
+    depth_normalized = torch.where(
+        positive_weight, depth_unnormalized / safe_weight_squared, 0.0
+    )
+    log_normalized = torch.where(
+        positive_weight, log_unnormalized / safe_weight_squared, 0.0
+    )
+    return depth_unnormalized, depth_normalized, log_unnormalized, log_normalized
+
+
 def _validate_3dgut_rasterize_mode(
     rasterize_mode: RasterizeMode,
     *,
@@ -263,6 +292,7 @@ def rasterization(
     with_ut: bool = False,
     with_eval3d: bool = False,
     return_normals: bool = False,
+    return_depth_dispersion: bool = False,
     global_z_order: bool = True,
     rays: Optional[
         Tensor
@@ -287,6 +317,9 @@ def rasterization(
         int
     ] = None,  # Currently only None or 3 is accepted.
     renderer_config: Optional[RendererConfig] = None,
+    velocities: Optional[Tensor] = None,  # [..., N, 3]
+    rays_time: Optional[Tensor] = None,  # [..., C, H, W]
+    lidar_phase_modeling: bool = False,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -443,7 +476,10 @@ def rasterization(
             The input Gaussians are expected to be a subset of scene in each rank, and
             the function will collaboratively render the images for all ranks.
         camera_model: The camera model to use. Supported models are "pinhole", "ortho",
-            "fisheye", and "ftheta". Default is "pinhole".
+            "fisheye", "ftheta", and "spherical". The spherical model is
+            equirectangular and requires ``with_ut=True``, ``with_eval3d=True``,
+            ``global_z_order=False``, and no distortion coefficients. Default is
+            "pinhole".
         segmented: Whether to use segmented radix sort. Default is False.
             Segmented radix sort performs sorting in segments, which is more efficient for the sorting operation itself.
             However, since it requires offset indices as input, additional global memory access is needed, which results
@@ -457,6 +493,15 @@ def rasterization(
             Normals are computed from Gaussian quaternions (canonical normal = (0,0,1)
             transformed by rotation, flipped if facing away from ray). Requires
             with_eval3d=True. Default is False.
+        return_depth_dispersion: Return differentiable linear depth moments plus
+            normalized and unnormalized squared pairwise raw-depth and log-depth
+            dispersion maps. ``meta["depth_linear_moments"]`` stores
+            ``[sum(w*z), sum(w*z**2), sum(w*log(z)), sum(w*log(z)**2)]``;
+            ``meta["depth_moment_weight_sum"]`` stores ``sum(w)``. Normalized
+            maps divide the pairwise numerator by ``sum(w)**2`` and therefore
+            equal twice the corresponding weighted variance. Requires
+            ``with_eval3d=True``. An exact zero hit distance is clamped to the
+            smallest positive float for the logarithm. Default is False.
         global_z_order: Whether to use z-depth (True) or Euclidean distance (False) for
             sorting Gaussians during rasterization. When True, Gaussians are sorted by their
             z-coordinate in camera space. When False, they are sorted by their Euclidean
@@ -519,6 +564,29 @@ def rasterization(
     """
     has_color = render_mode_has_color(render_mode)
 
+    if camera_model == "spherical":
+        if not (with_ut and with_eval3d):
+            raise ValueError(
+                "camera_model='spherical' requires with_ut=True and with_eval3d=True"
+            )
+        if global_z_order:
+            raise ValueError("camera_model='spherical' requires global_z_order=False")
+        if any(
+            value is not None
+            for value in (
+                radial_coeffs,
+                tangential_coeffs,
+                thin_prism_coeffs,
+                ftheta_coeffs,
+                external_distortion_coeffs,
+            )
+        ):
+            raise ValueError(
+                "camera_model='spherical' does not support camera distortion"
+            )
+
+    if return_depth_dispersion and not with_eval3d:
+        raise ValueError("return_depth_dispersion=True requires with_eval3d=True")
     external_distortion_coeffs = cast(
         Optional[BivariateWindshieldModelParameters], external_distortion_coeffs
     )
@@ -577,6 +645,7 @@ def rasterization(
         render_alphas,
         render_extra_signals,
         render_normals,
+        render_depth_moments,
         means2d_absgrad,
         batch_ids,
         camera_ids,
@@ -636,11 +705,15 @@ def rasterization(
         lidar_coeffs.to_cpp() if lidar_coeffs is not None else None,
         external_distortion_coeffs,
         global_z_order,
+        return_depth_dispersion,
         render_mode_has_hit_distance(render_mode),
         return_normals,
         renderer_config_impl,
         process_group_name,
         world_size,
+        velocities.contiguous() if velocities is not None else None,
+        rays_time.contiguous() if rays_time is not None else None,
+        lidar_phase_modeling,
     )
 
     if absgrad and not with_eval3d:
@@ -680,6 +753,20 @@ def rasterization(
         meta["render_extra_signals"] = render_extra_signals
     if return_normals:
         meta["normals"] = render_normals
+    if return_depth_dispersion:
+        weight_sum = render_alphas[..., 0]
+        (
+            depth_unnormalized,
+            depth_normalized,
+            log_unnormalized,
+            log_normalized,
+        ) = _depth_dispersions_from_linear_moments(render_depth_moments, weight_sum)
+        meta["depth_linear_moments"] = render_depth_moments
+        meta["depth_moment_weight_sum"] = weight_sum
+        meta["depth_squared_dispersion_unnormalized"] = depth_unnormalized
+        meta["depth_squared_dispersion"] = depth_normalized
+        meta["log_depth_squared_dispersion_unnormalized"] = log_unnormalized
+        meta["log_depth_squared_dispersion"] = log_normalized
 
     return render_colors, render_alphas, meta
 

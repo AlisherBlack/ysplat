@@ -26,6 +26,12 @@
 
 namespace gsplat
 {
+constexpr uint32_t DEPTH_MOMENT_COUNT = 4;
+constexpr uint32_t DEPTH_FIRST_MOMENT = 0;
+constexpr uint32_t DEPTH_SECOND_MOMENT = 1;
+constexpr uint32_t LOG_DEPTH_FIRST_MOMENT = 2;
+constexpr uint32_t LOG_DEPTH_SECOND_MOMENT = 3;
+
 //
 // Some Macros.
 //
@@ -79,6 +85,7 @@ enum CameraModelType
     FISHEYE = 2,
     FTHETA  = 3,
     LIDAR   = 4,
+    SPHERICAL = 5,
 };
 
 enum RendererConfig

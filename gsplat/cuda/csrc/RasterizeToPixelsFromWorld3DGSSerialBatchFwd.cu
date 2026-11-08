@@ -72,6 +72,7 @@ __global__ void
         const vec3 *__restrict__ means,        // [B, N, 3]
         const vec4 *__restrict__ quats,        // [B, N, 4]
         const vec3 *__restrict__ scales,       // [B, N, 3]
+        const vec3 *__restrict__ velocities,   // [B, N, 3] optional
         const float *__restrict__ colors,      // [B, C, N, CDIM] or [nnz, CDIM]
         const float *__restrict__ opacities,   // [B, C, N] or [nnz]
         const float *__restrict__ backgrounds, // [B, C, CDIM]
@@ -87,6 +88,7 @@ __global__ void
         const UnscentedTransformParameters ut_params,
         const ShutterType rs_type,
         const float *__restrict__ rays,              // [B, C, H, W, 6]
+        const float *__restrict__ rays_time,         // [B, C, H, W] optional
         const float *__restrict__ radial_coeffs,     // [B, C, 6] or [B, C, 4] optional
         const float *__restrict__ tangential_coeffs, // [B, C, 2] optional
         const float *__restrict__ thin_prism_coeffs, // [B, C, 4] optional
@@ -101,6 +103,7 @@ __global__ void
         float *__restrict__ render_normals,        // [B, C, image_height, image_width, 3] optional
         int32_t *__restrict__ last_ids,            // [B, C, image_height, image_width] optional
         int32_t *__restrict__ sample_counts,       // [B, C, image_height, image_width] optional
+        float *__restrict__ depth_moments,     // [B, C, image_height, image_width, 4] optional
         // Optional CSR batch-state persistence (for MixedBatch bwd reuse). See
         // RasterizeCSR.cuh.
         // Storage layout: [total_batches][state_dim][pixels_per_tile] fp32.
@@ -115,7 +118,8 @@ __global__ void
         // lockstep by the launcher (gated on `total_batches > 0`); both null ⇔
         // persistence disabled (e.g. `n_isects == 0`).
         const int32_t *__restrict__ batch_offsets_csr, // [num_tiles + 1]
-        float *__restrict__ fwd_batch_state            // [total_batches, state_dim, pixels_per_tile]
+        float *__restrict__ fwd_batch_state,           // [total_batches, state_dim, pixels_per_tile]
+        float *__restrict__ fwd_depth_moment_state     // [total_batches, 4, pixels_per_tile]
     )
 {
     // FETCH_SIZE = gaussians fetched per cooperative-fetch round (one per
@@ -180,6 +184,10 @@ __global__ void
     if(sample_counts != nullptr)
     {
         sample_counts += iid * image_height * image_width;
+    }
+    if(depth_moments != nullptr)
+    {
+        depth_moments += static_cast<uint64_t>(iid) * image_height * image_width * DEPTH_MOMENT_COUNT;
     }
     if(backgrounds != nullptr)
     {
@@ -249,6 +257,14 @@ __global__ void
                     {
                         sample_counts[pc[p].pix_id] = 0;
                     }
+                    if(depth_moments != nullptr)
+                    {
+#    pragma unroll
+                        for(uint32_t k = 0; k < DEPTH_MOMENT_COUNT; ++k)
+                        {
+                            depth_moments[pc[p].pix_id * DEPTH_MOMENT_COUNT + k] = 0.0f;
+                        }
+                    }
                 }
             }
         }
@@ -262,6 +278,10 @@ __global__ void
     {
         rays += iid * image_height * image_width * 6;
     }
+    if(rays_time != nullptr)
+    {
+        rays_time += iid * image_height * image_width;
+    }
 
     // Rolling shutter parameter (loop-invariant across pixel slots)
     auto rs_params
@@ -269,6 +289,7 @@ __global__ void
 
     vec3 ray_o[PIXELS_PER_THREAD] = {};
     vec3 ray_d[PIXELS_PER_THREAD] = {};
+    float ray_t[PIXELS_PER_THREAD] = {};
 #    pragma unroll
     for(uint32_t p = 0; p < PIXELS_PER_THREAD; ++p)
     {
@@ -305,6 +326,10 @@ __global__ void
         {
             ray_o[p] = ray.ray_org;
             ray_d[p] = ray.ray_dir;
+            if(rays_time != nullptr)
+            {
+                ray_t[p] = rays_time[pc[p].pix_id];
+            }
         }
     }
 
@@ -370,6 +395,8 @@ __global__ void
     mat3 *iscl_rot_batch    = reinterpret_cast<mat3 *>(&xyz_opacity_batch[FETCH_SIZE]); // [FETCH_SIZE]
     vec3 *scale_batch       = reinterpret_cast<vec3 *>(&iscl_rot_batch[FETCH_SIZE]);    // [FETCH_SIZE]
     vec3 *normal_batch      = reinterpret_cast<vec3 *>(&scale_batch[FETCH_SIZE]);       // [FETCH_SIZE]
+    vec3 *velocity_batch
+        = velocities != nullptr ? reinterpret_cast<vec3 *>(&normal_batch[FETCH_SIZE]) : nullptr; // [FETCH_SIZE]
 
     // Per-pixel state
     int32_t cur_idx[PIXELS_PER_THREAD];
@@ -385,6 +412,10 @@ __global__ void
     int32_t n_accumulated[PIXELS_PER_THREAD] = {0};
     float pix_out[PIXELS_PER_THREAD][CDIM]   = {0.f};
     vec3 normal_out[PIXELS_PER_THREAD]       = {};
+    float depth_first_moment[PIXELS_PER_THREAD]      = {};
+    float depth_second_moment[PIXELS_PER_THREAD]     = {};
+    float log_depth_first_moment[PIXELS_PER_THREAD]  = {};
+    float log_depth_second_moment[PIXELS_PER_THREAD] = {};
 
     // Per-batch persist of the CURRENT per-pixel cumulative state to CSR
     // slot c is delegated to `persist_batch_state` in
@@ -445,6 +476,9 @@ __global__ void
             // Per-pixel rays and accumulation state.
             ray_o,
             ray_d,
+            ray_t,
+            velocities,
+            velocity_batch,
             ALL_DONE,
             transmittance_threshold,
             T,
@@ -453,7 +487,11 @@ __global__ void
             normal_out,
             cur_idx,
             n_accumulated,
-            done_mask
+            done_mask,
+            depth_moments != nullptr ? depth_first_moment : nullptr,
+            depth_moments != nullptr ? depth_second_moment : nullptr,
+            depth_moments != nullptr ? log_depth_first_moment : nullptr,
+            depth_moments != nullptr ? log_depth_second_moment : nullptr
         );
 
         // --- Batch-boundary persist ---------------------------------------
@@ -471,6 +509,20 @@ __global__ void
             persist_batch_state<CDIM, PIXELS_PER_THREAD, CTA_SIZE, ReturnNormals>(
                 lb, batch_base_slot, pixels_per_tile, tid, T, pix_out, normal_out, fwd_batch_state
             );
+            if(fwd_depth_moment_state != nullptr)
+            {
+                persist_depth_moment_state<PIXELS_PER_THREAD, CTA_SIZE>(
+                    lb,
+                    batch_base_slot,
+                    pixels_per_tile,
+                    tid,
+                    depth_first_moment,
+                    depth_second_moment,
+                    log_depth_first_moment,
+                    log_depth_second_moment,
+                    fwd_depth_moment_state
+                );
+            }
         }
 
         // Block-level early exit (the all-done vote was already done
@@ -492,6 +544,20 @@ __global__ void
                     persist_batch_state<CDIM, PIXELS_PER_THREAD, CTA_SIZE, ReturnNormals>(
                         lbb, batch_base_slot, pixels_per_tile, tid, T, pix_out, normal_out, fwd_batch_state
                     );
+                    if(fwd_depth_moment_state != nullptr)
+                    {
+                        persist_depth_moment_state<PIXELS_PER_THREAD, CTA_SIZE>(
+                            lbb,
+                            batch_base_slot,
+                            pixels_per_tile,
+                            tid,
+                            depth_first_moment,
+                            depth_second_moment,
+                            log_depth_first_moment,
+                            log_depth_second_moment,
+                            fwd_depth_moment_state
+                        );
+                    }
                 }
             }
             break;
@@ -527,6 +593,14 @@ __global__ void
             {
                 sample_counts[pc[p].pix_id] = n_accumulated[p];
             }
+            if(depth_moments != nullptr)
+            {
+                const uint32_t offset = pc[p].pix_id * DEPTH_MOMENT_COUNT;
+                depth_moments[offset + DEPTH_FIRST_MOMENT] = depth_first_moment[p];
+                depth_moments[offset + DEPTH_SECOND_MOMENT] = depth_second_moment[p];
+                depth_moments[offset + LOG_DEPTH_FIRST_MOMENT] = log_depth_first_moment[p];
+                depth_moments[offset + LOG_DEPTH_SECOND_MOMENT] = log_depth_second_moment[p];
+            }
         }
     }
 }
@@ -536,6 +610,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_impl(
     const at::Tensor means,                     // [..., N, 3]
     const at::Tensor quats,                     // [..., N, 4]
     const at::Tensor scales,                    // [..., N, 3]
+    const at::optional<at::Tensor> velocities,  // [..., N, 3]
     const at::Tensor colors,                    // [..., C, N, channels] or [nnz, channels]
     const at::Tensor opacities,                 // [..., C, N] or [nnz]
     const at::optional<at::Tensor> backgrounds, // [..., C, channels]
@@ -553,6 +628,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_impl(
     const c10::intrusive_ptr<UnscentedTransformParameters> &ut_params,
     ShutterType rs_type,
     const at::optional<at::Tensor> rays,              // [...., C, H, W, 6]
+    const at::optional<at::Tensor> rays_time,         // [...., C, H, W]
     const at::optional<at::Tensor> radial_coeffs,     // [..., C, 6] or [..., C, 4] optional
     const at::optional<at::Tensor> tangential_coeffs, // [..., C, 2] optional
     const at::optional<at::Tensor> thin_prism_coeffs, // [..., C, 4] optional
@@ -575,7 +651,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_impl(
     at::Tensor last_ids,                    // [..., C, image_height, image_width]
     at::optional<at::Tensor> sample_counts, // [..., C, image_height, image_width]
     at::optional<at::Tensor> normals,       // [..., C, image_height, image_width, 3]
-    at::Tensor fwd_batch_state              // [total_batches, state_dim, pixels_per_tile] fp32
+    at::Tensor fwd_batch_state,             // [total_batches, state_dim, pixels_per_tile] fp32
+    at::Tensor fwd_depth_moment_state,      // [total_batches, 4, pixels_per_tile] fp32
+    at::optional<at::Tensor> depth_moments
 )
 {
     // Note: quats need to be normalized before passing in.
@@ -669,7 +747,13 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_impl(
         const dim3 grid    = {I, grid_h, grid_w};
         // Shared memory: id_batch + xyz_opacity_batch + iscl_rot_batch + scale_batch + normal_batch
         const int64_t shmem_size
-            = CTA_SIZE * (sizeof(int32_t) + sizeof(vec4) + sizeof(mat3) + sizeof(vec3) + sizeof(vec3));
+            = CTA_SIZE
+            * (sizeof(int32_t)
+               + sizeof(vec4)
+               + sizeof(mat3)
+               + sizeof(vec3)
+               + sizeof(vec3)
+               + (velocities.has_value() ? sizeof(vec3) : 0));
 
         if(cudaFuncSetAttribute(
                rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel<
@@ -703,6 +787,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_impl(
             data_ptr_as<const vec3, float>(means),
             data_ptr_as<const vec4, float>(quats),
             data_ptr_as<const vec3, float>(scales),
+            velocities.has_value() ? data_ptr_as<const vec3, float>(velocities.value()) : nullptr,
             colors.const_data_ptr<float>(),
             opacities.const_data_ptr<float>(),
             data_ptr_or_null<const float>(backgrounds),
@@ -717,6 +802,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_impl(
             *ut_params,
             rs_type,
             data_ptr_or_null<const float>(rays),
+            data_ptr_or_null<const float>(rays_time),
             data_ptr_or_null<const float>(radial_coeffs),
             data_ptr_or_null<const float>(tangential_coeffs),
             data_ptr_or_null<const float>(thin_prism_coeffs),
@@ -731,9 +817,11 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_impl(
             data_ptr_or_null<float>(normals),
             data_ptr_or_null<int32_t>(last_ids.defined(), last_ids),
             data_ptr_or_null<int32_t>(sample_counts),
+            data_ptr_or_null<float>(depth_moments),
             // CSR batch state persistence.
             data_ptr_or_null<const int32_t>(total_batches > 0, batch_offsets),
-            data_ptr_or_null<float>(total_batches > 0, fwd_batch_state)
+            data_ptr_or_null<float>(total_batches > 0, fwd_batch_state),
+            data_ptr_or_null<float>(total_batches > 0 && fwd_depth_moment_state.defined(), fwd_depth_moment_state)
         );
     };
     const bool dispatched = dispatch::dispatch(
@@ -752,6 +840,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
     const at::Tensor means,                     // [..., N, 3]
     const at::Tensor quats,                     // [..., N, 4]
     const at::Tensor scales,                    // [..., N, 3]
+    const at::optional<at::Tensor> velocities,  // [..., N, 3]
     const at::Tensor colors,                    // [..., C, N, channels] or [nnz, channels]
     const at::Tensor opacities,                 // [..., C, N] or [nnz]
     const at::optional<at::Tensor> backgrounds, // [..., C, channels]
@@ -769,6 +858,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
     const c10::intrusive_ptr<UnscentedTransformParameters> &ut_params,
     ShutterType rs_type,
     const at::optional<at::Tensor> rays,              // [...., C, H, W, 6]
+    const at::optional<at::Tensor> rays_time,         // [...., C, H, W]
     const at::optional<at::Tensor> radial_coeffs,     // [..., C, 6] or [..., C, 4] optional
     const at::optional<at::Tensor> tangential_coeffs, // [..., C, 2] optional
     const at::optional<at::Tensor> thin_prism_coeffs, // [..., C, 4] optional
@@ -791,13 +881,16 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
     at::Tensor last_ids,                    // [..., C, image_height, image_width]
     at::optional<at::Tensor> sample_counts, // [..., C, image_height, image_width]
     at::optional<at::Tensor> normals,       // [..., C, image_height, image_width, 3]
-    at::Tensor fwd_batch_state              // [total_batches, state_dim, pixels_per_tile] fp32
+    at::Tensor fwd_batch_state,             // [total_batches, state_dim, pixels_per_tile] fp32
+    at::Tensor fwd_depth_moment_state,      // [total_batches, 4, pixels_per_tile] fp32
+    at::optional<at::Tensor> depth_moments
 )
 {
     launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_impl(
         means,
         quats,
         scales,
+        velocities,
         colors,
         opacities,
         backgrounds,
@@ -812,6 +905,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
         ut_params,
         rs_type,
         rays,
+        rays_time,
         radial_coeffs,
         tangential_coeffs,
         thin_prism_coeffs,
@@ -830,7 +924,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
         last_ids,
         sample_counts,
         normals,
-        fwd_batch_state
+        fwd_batch_state,
+        fwd_depth_moment_state,
+        depth_moments
     );
 }
 } // namespace gsplat

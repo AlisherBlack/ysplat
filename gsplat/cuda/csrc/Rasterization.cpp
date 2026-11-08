@@ -2407,7 +2407,10 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
     const bool return_last_ids,
     const at::optional<at::Tensor> sample_counts, // [..., C, image_height, image_width] optional
     const at::optional<at::Tensor> normals,       // [..., C, image_height, image_width, 3] optional output tensor
-    const bool unsafe_masked_tile_outputs
+    const bool unsafe_masked_tile_outputs,
+    const bool return_depth_dispersion,
+    const at::optional<at::Tensor> velocities, // [..., N, 3]
+    const at::optional<at::Tensor> rays_time   // [..., C, H, W]
 )
 {
 #if !GSPLAT_BUILD_3DGUT
@@ -2588,6 +2591,37 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
             rays.value().scalar_type() == at::kFloat, "rays must be torch.float32, got ", rays.value().scalar_type()
         );
     }
+    if(camera_model == CameraModelType::SPHERICAL)
+    {
+        TORCH_CHECK_VALUE(
+            !radial_coeffs.has_value()
+                && !tangential_coeffs.has_value()
+                && !thin_prism_coeffs.has_value()
+                && !external_distortion_params.has_value(),
+            "spherical camera model does not support camera distortion"
+        );
+    }
+    if(velocities.has_value())
+    {
+        CHECK_INPUT(velocities.value());
+        TORCH_CHECK_VALUE(
+            velocities.value().sizes() == means.sizes(),
+            "velocities must have shape [*batch, N, 3], got ",
+            velocities.value().sizes()
+        );
+        TORCH_CHECK_VALUE(
+            rays.has_value() && rays_time.has_value(), "velocities require explicit rays and rays_time"
+        );
+    }
+    if(rays_time.has_value())
+    {
+        CHECK_INPUT(rays_time.value());
+        TORCH_CHECK_VALUE(
+            rays.has_value() && rays_time.value().sizes() == rays.value().sizes().slice(0, rays.value().dim() - 1),
+            "rays_time must have shape rays.shape[:-1], got ",
+            rays_time.value().sizes()
+        );
+    }
 
     TORCH_CHECK_VALUE(
         tile_size == 8u || tile_size == 16u, "3DGUT rasterization requires tile_size in (8, 16), got ", tile_size
@@ -2650,6 +2684,13 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
     alphas_shape.append({C, image_height, image_width, 1});
     at::Tensor alphas = at::empty(alphas_shape, opt);
 
+    at::Tensor depth_moments;
+    if(return_depth_dispersion)
+    {
+        at::DimVector moment_shape(batch_dims);
+        moment_shape.append({C, image_height, image_width, DEPTH_MOMENT_COUNT});
+        depth_moments = at::empty(moment_shape, opt.dtype(at::kFloat));
+    }
     at::Tensor compose_c_stop;
     at::Tensor priming_state;
     const int32_t pixels_per_tile   = tile_size * tile_size;
@@ -2663,7 +2704,16 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
         last_ids_shape.append({C, image_height, image_width});
         last_ids = at::empty(last_ids_shape, opt.dtype(at::kInt));
     }
-    const bool needs_batch_state = !fwd_only || renderer_config == RendererConfig::PARALLEL_BATCH;
+    // The parallel forward does not produce depth moments. Route moment
+    // requests through the serial implementation; backward remains the shared
+    // batch-parallel implementation.
+    const RendererConfig effective_renderer_config
+        = return_depth_dispersion ? RendererConfig::MIXED_BATCH : renderer_config;
+    TORCH_CHECK_VALUE(
+        !velocities.has_value() || effective_renderer_config == RendererConfig::MIXED_BATCH,
+        "velocities are only supported by the MixedBatch renderer"
+    );
+    const bool needs_batch_state = !fwd_only || effective_renderer_config == RendererConfig::PARALLEL_BATCH;
 
     // --- Build CSR batch structure + forward persistence buffer -----------
     // Non-fwd-only callers persist exact batch state because both MixedBatch and
@@ -2685,6 +2735,7 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
     at::Tensor batches_per_tile;
     at::Tensor batch_offsets;
     at::Tensor fwd_batch_state;
+    at::Tensor fwd_depth_moment_state;
     int64_t total_batches = 0;
     if(needs_batch_state)
     {
@@ -2701,15 +2752,21 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
         const int64_t state_dim
             = FWD_BATCH_STATE_PIX_OFFSET + channels + (return_normals ? FWD_BATCH_STATE_NORMAL_EXTRA : 0);
         fwd_batch_state = at::empty({total_batches, state_dim, pixels_per_tile}, opt.dtype(at::kFloat));
+        if(return_depth_dispersion)
+        {
+            fwd_depth_moment_state
+                = at::empty({total_batches, DEPTH_MOMENT_COUNT, pixels_per_tile}, opt.dtype(at::kFloat));
+        }
     }
 
     // --- Launch selected forward kernel -----------------------------------
-    if(renderer_config == RendererConfig::MIXED_BATCH)
+    if(effective_renderer_config == RendererConfig::MIXED_BATCH)
     {
         launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
             means,
             quats,
             scales,
+            velocities,
             colors,
             opacities,
             backgrounds,
@@ -2724,6 +2781,7 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
             ut_params,
             rs_type,
             rays,
+            rays_time,
             radial_coeffs,
             tangential_coeffs,
             thin_prism_coeffs,
@@ -2742,7 +2800,9 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
             last_ids,
             sample_counts,
             normals,
-            fwd_batch_state
+            fwd_batch_state,
+            fwd_depth_moment_state,
+            as_optional_tensor(depth_moments)
         );
     }
     else
@@ -2842,8 +2902,10 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
         .batches_per_tile = batches_per_tile,
         .batch_offsets    = batch_offsets,
         .fwd_batch_state  = fwd_batch_state,
+        .fwd_depth_moment_state = fwd_depth_moment_state,
         .compose_c_stop   = compose_c_stop,
         .priming_state    = priming_state,
+        .depth_moments = depth_moments,
     };
 #endif // !GSPLAT_BUILD_3DGUT
 }
@@ -2906,6 +2968,7 @@ namespace
         at::Tensor v_opacities;
         at::Tensor v_backgrounds;
         at::optional<at::Tensor> v_rays;
+        at::optional<at::Tensor> v_velocities;
     };
 
     // Gradients of the differentiable forward outputs.
@@ -2915,6 +2978,7 @@ namespace
         at::optional<at::Tensor> renders;
         at::optional<at::Tensor> alphas;
         at::optional<at::Tensor> normals;
+        at::optional<at::Tensor> depth_moments;
     };
 
     RasterizeBwdResult rasterize_to_pixels_from_world_3dgs_bwd(
@@ -2930,6 +2994,8 @@ namespace
         const at::optional<at::Tensor> &viewmats1,
         const at::Tensor &Ks,
         const at::optional<at::Tensor> &rays,
+        const at::optional<at::Tensor> &rays_time,
+        const at::optional<at::Tensor> &velocities,
         const at::optional<at::Tensor> &radial_coeffs,
         const at::optional<at::Tensor> &tangential_coeffs,
         const at::optional<at::Tensor> &thin_prism_coeffs,
@@ -2937,11 +3003,13 @@ namespace
         const at::Tensor &flatten_ids,
         // forward outputs
         const at::Tensor &render_alphas,
+        const at::optional<at::Tensor> &depth_moments,
         const at::Tensor &last_ids,
         // CSR batch structure persisted by forward
         const at::Tensor &batches_per_tile,
         const at::Tensor &batch_offsets,
         const at::Tensor &fwd_batch_state,
+        const at::optional<at::Tensor> &fwd_depth_moment_state,
         const at::optional<at::Tensor> &compose_c_stop,
         // scalars
         int64_t image_width,
@@ -2980,6 +3048,12 @@ namespace
             v_render_normals = at::zeros(normal_grad_shape, means.options().dtype(at::kFloat));
         }
 
+        at::optional<at::Tensor> v_depth_moments;
+        if(grad.depth_moments.has_value())
+        {
+            v_depth_moments = grad.depth_moments.value().contiguous();
+        }
+
         // --- Validate restored CUDA inputs --------------------------------
         DEVICE_GUARD(means);
         CHECK_INPUT(means);
@@ -3012,6 +3086,14 @@ namespace
         {
             CHECK_INPUT(v_render_normals.value());
         }
+        if(v_depth_moments.has_value())
+        {
+            TORCH_CHECK(depth_moments.has_value(), "depth_moments output was not saved for backward");
+            CHECK_INPUT(depth_moments.value());
+            CHECK_INPUT(v_depth_moments.value());
+            TORCH_CHECK(fwd_depth_moment_state.has_value(), "depth-moment batch state was not saved");
+            CHECK_INPUT(fwd_depth_moment_state.value());
+        }
 
         // compose_c_stop is defined only for the ParallelBatch forward; an
         // undefined tensor signals the kernel to use the terminal-slot stopping path.
@@ -3028,12 +3110,16 @@ namespace
         at::Tensor v_opacities = at::zeros_like(opacities);
         at::optional<at::Tensor> v_rays
             = rays.has_value() ? at::optional<at::Tensor>(at::zeros_like(rays.value())) : at::optional<at::Tensor>();
+        at::optional<at::Tensor> v_velocities = velocities.has_value()
+                                                  ? at::optional<at::Tensor>(at::zeros_like(velocities.value()))
+                                                  : at::optional<at::Tensor>();
 
         // --- Launch batch-parallel backward kernel ------------------------
         launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
             means,
             quats,
             scales,
+            velocities,
             colors,
             opacities,
             backgrounds,
@@ -3048,6 +3134,7 @@ namespace
             ut_params,
             rs_type,
             rays,
+            rays_time,
             radial_coeffs,
             tangential_coeffs,
             thin_prism_coeffs,
@@ -3059,20 +3146,24 @@ namespace
             use_hit_distance,
             render_alphas,
             last_ids,
+            depth_moments,
             v_render_colors,
             v_render_alphas,
             v_render_normals,
+            v_depth_moments,
             batches_per_tile,
             batch_offsets,
             fwd_batch_state.size(0),
             fwd_batch_state,
+            fwd_depth_moment_state.value_or(at::Tensor{}),
             compose_c_stop_tensor,
             v_means,
             v_quats,
             v_scales,
             v_colors,
             v_opacities,
-            v_rays
+            v_rays,
+            v_velocities
         );
 
         // --- Compute background gradient ----------------------------------
@@ -3094,6 +3185,7 @@ namespace
             .v_opacities   = v_opacities,
             .v_backgrounds = v_backgrounds,
             .v_rays        = v_rays,
+            .v_velocities  = v_velocities,
         };
     }
 
@@ -3138,6 +3230,9 @@ namespace
                 RENDERER_CONFIG,
                 RETURN_LAST_IDS,
                 UNSAFE_MASKED_TILE_OUTPUTS,
+                RETURN_DEPTH_DISPERSION,
+                VELOCITIES,
+                RAYS_TIME,
                 COUNT,
             };
         };
@@ -3154,6 +3249,7 @@ namespace
                 LAST_IDS,
                 SAMPLE_COUNTS,
                 NORMALS,
+                DEPTH_MOMENTS,
                 COUNT
             };
         };
@@ -3196,7 +3292,10 @@ namespace
             bool return_normals,
             int64_t renderer_config,
             bool return_last_ids,
-            bool unsafe_masked_tile_outputs
+            bool unsafe_masked_tile_outputs,
+            bool return_depth_dispersion,
+            const at::optional<at::Tensor> &velocities, // [..., N, 3]
+            const at::optional<at::Tensor> &rays_time   // [..., C, H, W]
         )
         {
             static_assert(
@@ -3256,7 +3355,10 @@ namespace
                 /*return_last_ids=*/true,
                 optional_outputs.sample_counts,
                 optional_outputs.normals,
-                unsafe_masked_tile_outputs
+                unsafe_masked_tile_outputs,
+                return_depth_dispersion,
+                velocities,
+                rays_time
             );
 
             // --- Save state for backward --------------------------------------
@@ -3276,16 +3378,20 @@ namespace
                 viewmats1,
                 Ks,
                 rays,
+                rays_time,
+                velocities,
                 radial_coeffs,
                 tangential_coeffs,
                 thin_prism_coeffs,
                 tile_offsets,
                 flatten_ids,
                 fwd.alphas,
+                as_optional_tensor(fwd.depth_moments),
                 fwd.last_ids,
                 fwd.batches_per_tile,
                 fwd.batch_offsets,
                 fwd.fwd_batch_state,
+                as_optional_tensor(fwd.fwd_depth_moment_state),
                 as_optional_tensor(fwd.compose_c_stop),
                 image_width,
                 image_height,
@@ -3313,6 +3419,9 @@ namespace
                 = optional_outputs.sample_counts.value_or(at::empty({0}, means.options().dtype(at::kInt)));
             at::Tensor normals_output
                 = optional_outputs.normals.value_or(at::empty({0}, means.options().dtype(at::kFloat)));
+            at::Tensor depth_moments_output = fwd.depth_moments.defined()
+                ? fwd.depth_moments
+                : at::empty({0}, means.options().dtype(at::kFloat));
 
             if(!return_normals)
             {
@@ -3325,6 +3434,7 @@ namespace
             out[FwdOutput::LAST_IDS]      = last_ids_output;
             out[FwdOutput::SAMPLE_COUNTS] = sample_counts_output;
             out[FwdOutput::NORMALS]       = normals_output;
+            out[FwdOutput::DEPTH_MOMENTS] = depth_moments_output;
             return out;
         }
 
@@ -3336,6 +3446,7 @@ namespace
                 .renders = as_optional_tensor(grad_outputs[FwdOutput::RENDERS]),
                 .alphas  = as_optional_tensor(grad_outputs[FwdOutput::ALPHAS]),
                 .normals = as_optional_tensor(grad_outputs[FwdOutput::NORMALS]),
+                .depth_moments = as_optional_tensor(grad_outputs[FwdOutput::DEPTH_MOMENTS]),
             };
             RasterizeBwdResult g = apply_bwd<&rasterize_to_pixels_from_world_3dgs_bwd>(ctx, grad);
 
@@ -3347,6 +3458,7 @@ namespace
             grads[FwdInput::OPACITIES]   = g.v_opacities;
             grads[FwdInput::BACKGROUNDS] = g.v_backgrounds;
             grads[FwdInput::RAYS]        = as_tensor(g.v_rays);
+            grads[FwdInput::VELOCITIES]  = as_tensor(g.v_velocities);
             return grads;
         }
 
@@ -3384,7 +3496,10 @@ namespace
             bool return_normals,
             int64_t renderer_config,
             bool return_last_ids,
-            bool unsafe_masked_tile_outputs
+            bool unsafe_masked_tile_outputs,
+            bool return_depth_dispersion,
+            const at::optional<at::Tensor> &velocities,
+            const at::optional<at::Tensor> &rays_time
         )
         {
             torch::autograd::variable_list outputs = apply(
@@ -3418,7 +3533,10 @@ namespace
                 return_normals,
                 renderer_config,
                 return_last_ids,
-                unsafe_masked_tile_outputs
+                unsafe_masked_tile_outputs,
+                return_depth_dispersion,
+                velocities,
+                rays_time
             );
             return {
                 .renders  = outputs[FwdOutput::RENDERS],
@@ -3427,6 +3545,9 @@ namespace
                 .sample_counts
                 = return_sample_counts ? at::optional<at::Tensor>(outputs[FwdOutput::SAMPLE_COUNTS]) : c10::nullopt,
                 .normals = return_normals ? at::optional<at::Tensor>(outputs[FwdOutput::NORMALS]) : c10::nullopt,
+                .depth_moments = return_depth_dispersion
+                    ? at::optional<at::Tensor>(outputs[FwdOutput::DEPTH_MOMENTS])
+                    : c10::nullopt,
             };
         }
     };
@@ -3475,7 +3596,10 @@ RasterizeToPixelsFromWorld3DGSResult rasterize_to_pixels_from_world_3dgs(
     bool return_normals,
     int64_t renderer_config,
     bool return_last_ids,
-    bool unsafe_masked_tile_outputs
+    bool unsafe_masked_tile_outputs,
+    bool return_depth_dispersion,
+    const at::optional<at::Tensor> &velocities, // [..., N, 3]
+    const at::optional<at::Tensor> &rays_time   // [..., C, H, W]
 )
 {
 #if !GSPLAT_BUILD_3DGUT
@@ -3498,7 +3622,9 @@ RasterizeToPixelsFromWorld3DGSResult rasterize_to_pixels_from_world_3dgs(
         tangential_coeffs,
         thin_prism_coeffs,
         tile_offsets,
-        flatten_ids
+        flatten_ids,
+        velocities,
+        rays_time
     );
 
     if(!use_custom_autograd)
@@ -3543,7 +3669,10 @@ RasterizeToPixelsFromWorld3DGSResult rasterize_to_pixels_from_world_3dgs(
             return_last_ids,
             optional_outputs.sample_counts,
             optional_outputs.normals,
-            unsafe_masked_tile_outputs
+            unsafe_masked_tile_outputs,
+            return_depth_dispersion,
+            velocities,
+            rays_time
         );
         return {
             .renders       = fwd.renders,
@@ -3551,6 +3680,7 @@ RasterizeToPixelsFromWorld3DGSResult rasterize_to_pixels_from_world_3dgs(
             .last_ids      = return_last_ids ? at::optional<at::Tensor>(fwd.last_ids) : c10::nullopt,
             .sample_counts = optional_outputs.sample_counts,
             .normals       = optional_outputs.normals,
+            .depth_moments = as_optional_tensor(fwd.depth_moments),
         };
     }
 
@@ -3585,7 +3715,10 @@ RasterizeToPixelsFromWorld3DGSResult rasterize_to_pixels_from_world_3dgs(
         return_normals,
         renderer_config,
         return_last_ids,
-        unsafe_masked_tile_outputs
+        unsafe_masked_tile_outputs,
+        return_depth_dispersion,
+        velocities,
+        rays_time
     );
 #endif // !GSPLAT_BUILD_3DGUT
 }

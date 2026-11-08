@@ -37,6 +37,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
     const at::Tensor means,                     // [..., N, 3]
     const at::Tensor quats,                     // [..., N, 4]
     const at::Tensor scales,                    // [..., N, 3]
+    const at::optional<at::Tensor> velocities,  // [..., N, 3]
     const at::Tensor colors,                    // [..., C, N, channels] or [nnz, channels]
     const at::Tensor opacities,                 // [..., C, N]  or [nnz]
     const at::optional<at::Tensor> backgrounds, // [..., C, channels]
@@ -54,6 +55,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
     const c10::intrusive_ptr<UnscentedTransformParameters> &ut_params,
     ShutterType rs_type,
     const at::optional<at::Tensor> rays,                                       // [..., C, H, W, 6]
+    const at::optional<at::Tensor> rays_time,                                  // [..., C, H, W]
     const at::optional<at::Tensor> radial_coeffs,                              // [..., C, 6] or [..., C, 4] optional
     const at::optional<at::Tensor> tangential_coeffs,                          // [..., C, 2] optional
     const at::optional<at::Tensor> thin_prism_coeffs,                          // [..., C, 4] optional
@@ -75,8 +77,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
     at::Tensor last_ids,                    // [..., C, image_height, image_width]
     at::optional<at::Tensor> sample_counts, // [..., C, image_height, image_width]
     at::optional<at::Tensor> normals,       // [..., C, image_height, image_width, 3]
-    at::Tensor
-        fwd_batch_state // [total_batches, state_dim, pixels_per_tile] fp32, persisted cumulative state for bwd reuse
+    at::Tensor fwd_batch_state, // [total_batches, state_dim, pixels_per_tile] fp32, persisted cumulative state for bwd reuse
+    at::Tensor fwd_depth_moment_state, // [total_batches, 4, pixels_per_tile] fp32
+    at::optional<at::Tensor> depth_moments
 );
 
 void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_fwd_kernel(
@@ -136,6 +139,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
     const at::Tensor means,                     // [..., N, 3]
     const at::Tensor quats,                     // [..., N, 4]
     const at::Tensor scales,                    // [..., N, 3]
+    const at::optional<at::Tensor> velocities,  // [..., N, 3]
     const at::Tensor colors,                    // [..., C, N, channels] or [nnz, channels]
     const at::Tensor opacities,                 // [..., C, N] or [nnz]
     const at::optional<at::Tensor> backgrounds, // [..., C, channels]
@@ -153,6 +157,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
     const c10::intrusive_ptr<UnscentedTransformParameters> &ut_params,
     ShutterType rs_type,
     const at::optional<at::Tensor> rays,                                       // [..., C, H, W, 6]
+    const at::optional<at::Tensor> rays_time,                                  // [..., C, H, W]
     const at::optional<at::Tensor> radial_coeffs,                              // [..., C, 6] or [..., C, 4] optional
     const at::optional<at::Tensor> tangential_coeffs,                          // [..., C, 2] optional
     const at::optional<at::Tensor> thin_prism_coeffs,                          // [..., C, 4] optional
@@ -166,16 +171,19 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
     // forward outputs
     const at::Tensor render_alphas, // [..., C, image_height, image_width, 1]
     const at::Tensor last_ids,      // [..., C, image_height, image_width]
+    const at::optional<at::Tensor> depth_moments, // [..., C, image_height, image_width, 4]
     // gradients of outputs
     const at::Tensor v_render_colors,                // [..., C, image_height, image_width, 3]
     const at::Tensor v_render_alphas,                // [..., C, image_height, image_width, 1]
     const at::optional<at::Tensor> v_render_normals, // [..., C, image_height, image_width, 3]
+    const at::optional<at::Tensor> v_depth_moments,  // [..., C, image_height, image_width, 4]
     // CSR batch structure (precomputed by forward)
     const at::Tensor batches_per_tile, // [num_tiles] int32
     const at::Tensor batch_offsets,    // [num_tiles + 1] int32
     const int64_t total_batches,       // scalar; equals batch_offsets[num_tiles]
     // Per-batch cumulative (T, pix_out, normal_out) persisted by the fwd pass.
     const at::Tensor fwd_batch_state, // [total_batches, state_dim, pixels_per_tile] fp32
+    const at::Tensor fwd_depth_moment_state, // [total_batches, 4, pixels_per_tile] fp32
     // ParallelBatch-only saturation handoff. Undefined tensor keeps MixedBatch
     // on the legacy terminal-slot path without placeholder allocations.
     const at::Tensor compose_c_stop, // [num_tiles, pixels_per_tile] uint16
@@ -185,6 +193,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
     at::Tensor v_scales,            // [..., N, 3]
     at::Tensor v_colors,            // [..., C, N, 3] or [nnz, 3]
     at::Tensor v_opacities,         // [..., C, N] or [nnz]
-    at::optional<at::Tensor> v_rays // [..., C, image_height, image_width, 6]
+    at::optional<at::Tensor> v_rays, // [..., C, image_height, image_width, 6]
+    at::optional<at::Tensor> v_velocities // [..., N, 3]
 );
 } // namespace gsplat
